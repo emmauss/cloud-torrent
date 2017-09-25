@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -15,9 +16,11 @@ import (
 
 	"github.com/jpillora/cloud-torrent/engine"
 	"github.com/jpillora/cloud-torrent/static"
-	"github.com/jpillora/go-realtime"
+	"github.com/jpillora/cookieauth"
+	"github.com/jpillora/gziphandler"
 	"github.com/jpillora/requestlog"
 	"github.com/jpillora/scraper/scraper"
+	"github.com/jpillora/velox"
 	"github.com/skratchdot/open-golang/open"
 )
 
@@ -39,16 +42,14 @@ type Server struct {
 	scraperh      http.Handler
 	//torrent engine
 	engine *engine.Engine
-	//realtime state (sync'd with browser immediately)
-	rt    *realtime.Handler
-	state struct {
-		realtime.Object
+	state  struct {
+		velox.State
 		sync.Mutex
 		Config          engine.Config
 		SearchProviders scraper.Config
 		Downloads       *fsNode
 		Torrents        map[string]*engine.Torrent
-		Users           map[string]*realtime.User
+		Users           map[string]string
 		Stats           struct {
 			Title   string
 			Version string
@@ -60,8 +61,8 @@ type Server struct {
 
 func (s *Server) Run(version string) error {
 
-	tls := s.CertPath != "" || s.KeyPath != "" //poor man's XOR
-	if tls && (s.CertPath == "" || s.KeyPath == "") {
+	isTLS := s.CertPath != "" || s.KeyPath != "" //poor man's XOR
+	if isTLS && (s.CertPath == "" || s.KeyPath == "") {
 		return fmt.Errorf("You must provide both key and cert paths")
 	}
 
@@ -71,35 +72,26 @@ func (s *Server) Run(version string) error {
 	s.state.Stats.Uptime = time.Now()
 
 	//init maps
-	s.state.Users = map[string]*realtime.User{}
+	s.state.Users = map[string]string{}
 	//will use a the local embed/ dir if it exists, otherwise will use the hardcoded embedded binaries
 	s.files = http.HandlerFunc(s.serveFiles)
 	s.static = ctstatic.FileSystemHandler()
-	s.scraper = &scraper.Handler{Log: false}
+	s.scraper = &scraper.Handler{
+		Log: false, Debug: false,
+		Headers: map[string]string{
+			//we're a trusty browser :)
+			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
+		},
+	}
 	if err := s.scraper.LoadConfig(defaultSearchConfig); err != nil {
 		log.Fatal(err)
 	}
+
 	s.state.SearchProviders = s.scraper.Config //share scraper config
+	go s.fetchSearchConfigLoop()
 	s.scraperh = http.StripPrefix("/search", s.scraper)
 
 	s.engine = engine.New()
-
-	//realtime
-	s.rt = realtime.NewHandler()
-	if err := s.rt.Add("state", &s.state); err != nil {
-		log.Fatalf("State object not syncable: %s", err)
-	}
-	//realtime user events
-	go func() {
-		for user := range s.rt.UserEvents() {
-			if user.Connected {
-				s.state.Users[user.ID] = user
-			} else {
-				delete(s.state.Users, user.ID)
-			}
-			s.state.Update()
-		}
-	}()
 
 	//configure engine
 	c := engine.Config{
@@ -129,9 +121,8 @@ func (s *Server) Run(version string) error {
 			s.state.Lock()
 			s.state.Torrents = s.engine.GetTorrents()
 			s.state.Downloads = s.listFiles()
-			// log.Printf("torrents #%d files #%d", len(s.state.Torrents), len(s.state.Downloads.Children))
 			s.state.Unlock()
-			s.state.Update()
+			s.state.Push()
 			time.Sleep(1 * time.Second)
 		}
 	}()
@@ -142,11 +133,9 @@ func (s *Server) Run(version string) error {
 	}
 	addr := fmt.Sprintf("%s:%d", host, s.Port)
 	proto := "http"
-	if tls {
+	if isTLS {
 		proto += "s"
 	}
-	log.Printf("Listening at %s://%s", proto, addr)
-
 	if s.Open {
 		openhost := host
 		if openhost == "0.0.0.0" {
@@ -157,17 +146,36 @@ func (s *Server) Run(version string) error {
 			open.Run(fmt.Sprintf("%s://%s:%d", proto, openhost, s.Port))
 		}()
 	}
-
+	//define handler chain, from last to first
 	h := http.Handler(http.HandlerFunc(s.handle))
+	h = gziphandler.GzipHandler(h)
+	if s.Auth != "" {
+		user := s.Auth
+		pass := ""
+		if s := strings.SplitN(s.Auth, ":", 2); len(s) == 2 {
+			user = s[0]
+			pass = s[1]
+		}
+		h = cookieauth.Wrap(h, user, pass)
+		log.Printf("Enabled HTTP authentication")
+	}
 	if s.Log {
 		h = requestlog.Wrap(h)
 	}
-
-	if tls {
-		return http.ListenAndServeTLS(addr, s.CertPath, s.KeyPath, h)
-	} else {
-		return http.ListenAndServe(addr, h)
+	log.Printf("Listening at %s://%s", proto, addr)
+	//serve!
+	server := http.Server{
+		//disable http2 due to velox bug
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
+		//address
+		Addr: addr,
+		//handler stack
+		Handler: h,
 	}
+	if isTLS {
+		return server.ListenAndServeTLS(s.CertPath, s.KeyPath)
+	}
+	return server.ListenAndServe()
 }
 
 func (s *Server) reconfigure(c engine.Config) error {
@@ -182,30 +190,29 @@ func (s *Server) reconfigure(c engine.Config) error {
 	b, _ := json.MarshalIndent(&c, "", "  ")
 	ioutil.WriteFile(s.ConfigPath, b, 0755)
 	s.state.Config = c
-	s.state.Update()
+	s.state.Push()
 	return nil
 }
 
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
-
-	//handle realtime client connections
-	if r.URL.Path == "/realtime.js" {
-		realtime.JS.ServeHTTP(w, r)
-		return
-	} else if r.URL.Path == "/realtime" {
-		s.rt.ServeHTTP(w, r)
+	//handle realtime client library
+	if r.URL.Path == "/js/velox.js" {
+		velox.JS.ServeHTTP(w, r)
 		return
 	}
-
-	//basic auth
-	if s.Auth != "" {
-		u, p, _ := r.BasicAuth()
-		if s.Auth != u+":"+p {
-			w.Header().Set("WWW-Authenticate", "Basic")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Access Denied"))
+	//handle realtime client connections
+	if r.URL.Path == "/sync" {
+		conn, err := velox.Sync(&s.state, w, r)
+		if err != nil {
+			log.Printf("sync failed: %s", err)
 			return
 		}
+		s.state.Users[conn.ID()] = r.RemoteAddr
+		s.state.Push()
+		conn.Wait()
+		delete(s.state.Users, conn.ID())
+		s.state.Push()
+		return
 	}
 	//search
 	if strings.HasPrefix(r.URL.Path, "/search") {
